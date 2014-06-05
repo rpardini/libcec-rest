@@ -6,6 +6,7 @@ import net.pardini.cecrest.util.StreamGobbler;
 import net.schmizz.sshj.SSHClient;
 import net.schmizz.sshj.connection.channel.direct.Session;
 import net.schmizz.sshj.connection.channel.direct.Signal;
+import net.schmizz.sshj.transport.TransportException;
 import net.schmizz.sshj.transport.verification.HostKeyVerifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,10 +15,7 @@ import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.io.OutputStreamWriter;
-import java.io.PrintWriter;
+import java.io.*;
 import java.security.PublicKey;
 import java.util.ArrayList;
 import java.util.List;
@@ -49,6 +47,8 @@ public class SSHCECManager implements CECManager {
     private StreamGobbler streamGobbler;
     private InputStream inputStream;
     private OutputStream outputStream;
+    private SSHClient ssh;
+    private Session session;
 
 // ------------------------ INTERFACE METHODS ------------------------
 
@@ -82,14 +82,55 @@ public class SSHCECManager implements CECManager {
 // -------------------------- OTHER METHODS --------------------------
 
     @PreDestroy
-    public void cleanup() throws Exception {
-        streamGobbler.interrupt();
-        inputStream.close();
-        outputStream.close();
+    public void cleanup() {
+        try {
+            streamGobbler.interrupt();
+        } catch (Exception e) {
+            logger.error("Error interrupting streamGobbler...", e);
+        }
 
-        command.signal(Signal.HUP);
-        command.join();
-        command.close();
+        try {
+            inputStream.close();
+        } catch (IOException e) {
+            logger.error("Error closing input stream", e);
+
+        }
+        try {
+            outputStream.close();
+        } catch (IOException e) {
+            logger.error("Error closing output stream", e);
+        }
+
+        try {
+            command.signal(Signal.HUP);
+        } catch (TransportException e) {
+            logger.error("Error sending HUP signal", e);
+        }
+
+        try {
+            command.close();
+        } catch (Exception e) {
+            logger.error("Error closing command", e);
+        } finally {
+            command = null;
+        }
+
+
+        try {
+            session.close();
+        } catch (Exception e) {
+            logger.error("Error closing session", e);
+        } finally {
+            session = null;
+        }
+
+        try {
+            ssh.close();
+        } catch (IOException e) {
+            logger.error("Error closing ssh client", e);
+        } finally {
+            ssh = null;
+        }
     }
 
     private CECDevice getCurrentDeviceStatus(final Long deviceId) {
@@ -98,7 +139,7 @@ public class SSHCECManager implements CECManager {
 
     @PostConstruct
     public void initialize() throws Exception {
-        SSHClient ssh = new SSHClient();
+        ssh = new SSHClient();
         ssh.addHostKeyVerifier(new HostKeyVerifier() {
             @Override
             public boolean verify(final String s, final int i, final PublicKey publicKey) {
@@ -107,7 +148,8 @@ public class SSHCECManager implements CECManager {
         });
         ssh.connect(cecSshHost);
         ssh.authPassword(cecSshUser, cecSshPass);
-        final Session session = ssh.startSession();
+
+        session = ssh.startSession();
 
         command = session.exec(String.format("cec-client --osd-name \"%s\"", cecOsdName));
 
@@ -129,8 +171,27 @@ public class SSHCECManager implements CECManager {
     }
 
     private void sendCommand(final String command) {
+        checkConnectionAndReconnectIfNecessary();
         printWriter.println(command);
         printWriter.flush();
+    }
+
+    private void checkConnectionAndReconnectIfNecessary() {
+        logger.info("Checking connection: Command: " + command.isOpen());
+        logger.info("Checking connection: Session: " + session.isOpen());
+        logger.info("Checking connection: SSH: " + ssh.isConnected());
+        if ((!command.isOpen()) || (!session.isOpen()) || (!ssh.isConnected())) {
+            logger.error("Connection has problems, let's reconnect...");
+            try {
+                cleanup();
+                initialize();
+                Thread.sleep(1500);
+                logger.warn("Reconnected...");
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        }
+        logger.info("Done rechecking connection...");
     }
 
     private ArrayList<String> waitForOutputLine(final String lineToWaitFor) {
